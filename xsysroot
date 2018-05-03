@@ -54,6 +54,114 @@ default_settings='''
 }
 '''
 
+class ImageHandler:
+    '''
+    Base class defining what an image handler must implement
+    '''
+    def get_display_number(self):
+        raise NotImplemented
+
+    def mount_root(self, settings):
+        raise NotImplemented
+
+    def mount_boot(self, settings):
+        raise NotImplemented
+
+    def free(self):
+        raise NotImplemented
+
+    def mount_additional(self):
+        raise NotImplemented
+
+    def unmount_boot(self):
+        raise NotImplemented
+
+    def unmount_root(self):
+        raise NotImplemented
+
+
+
+class QemuImageHandler(ImageHandler):
+
+    def __init__(self, settings):
+        ImageHandler.__init__(self)
+        self.settings = settings
+
+    def get_display_number(self):
+        # The display number will be bound to the same NBDEV device number
+        display_number = re.search('(\d+)', self.settings['nbdev']).group()
+
+    def mount_root(self):
+
+        # Connect the image and mount the "nbdev" root partition
+        p=self._run_cmd('sudo qemu-nbd -c {nbdev} {qcow_image}; sync'.format(**self.settings))
+        print 'mounting root partition {nbdev}{nbdev_part} -> {sysroot}'.format(**self.settings)
+        p=self._run_cmd('sudo mount {nbdev}{nbdev_part} {sysroot}'.format(**self.settings))
+
+
+    def mount_boot(self):
+        if self.settings.has_key('boot_part') and self.settings.has_key('sysboot'):
+            p=self._run_cmd('mkdir -p {}'.format(self.settings['sysboot']))
+            print 'mounting boot partition {nbdev}{boot_part} -> {sysboot}'.format(**self.settings)
+            rc=self._run_cmd('sudo mount {nbdev}{boot_part} {sysboot}'.format(**self.settings))
+            if not rc:
+                # Create a bind mount so the boot partition is accesible from the root
+                self._run_cmd('sudo mount --bind {sysboot} {sysroot}/boot'.format(**self.settings))
+
+    def free(self):
+        p=self._run_cmd('sudo qemu-nbd -d {nbdev}; sync'.format(**self.self.settings))
+
+
+    def _get_add_mounts(self):
+        '''
+        Returns a list of dictionaries of additional mount points.
+        These optional mounts can be specified using the "add_mounts" key in the
+        configuration file, for example:
+
+          "add_mounts" : "p3:/tmp/third p4:/tmp/fourth"
+
+        Each dictionary comes in the form: { 'device': '/dev/nbdXpY', 'mount': '/wherever' }
+        If no additional mounts are specified, an empty list is returned.
+        '''
+        additional_mounts=[]
+
+        if self.settings.has_key('add_mounts'):
+            extra_mounts = self.settings['add_mounts'].split(' ')
+            for new_mount in extra_mounts:
+                new_device, new_mountpoint = new_mount.split(':')
+                additional_mounts.append(
+                    { 'device' : '{}{}'.format(self.settings['nbdev'], new_device),
+                      'mount'  : '{}'.format(new_mountpoint) })
+
+        return additional_mounts
+
+
+    def mount_additional(self):
+        add_mounts = self._get_add_mounts()
+        if len(add_mounts):
+            print 'mounting additional partitions'
+            for extra_mount in add_mounts:
+                rc=self._run_cmd('mkdir {mount} ; sudo mount {device} {mount}'.format(**extra_mount))
+                print 'mounted {} => {} rc={}'.format(
+                    extra_mount['device'], extra_mount['mount'], rc)
+
+    def umount_additional(self):
+        add_mounts = self._get_add_mounts()
+        if len(add_mounts):
+            for extra_mount in add_mounts:
+                rc=self._run_cmd('sudo umount {mount} ; rmdir {mount}'.format(**extra_mount))
+
+
+    def unmount_boot(self):
+        if self.settings.has_key('boot_part') and self.settings.has_key('sysboot'):
+            p=self._run_cmd('sudo umount {sysboot}'.format(**self.settings))
+            p=self._run_cmd('rmdir {sysboot}'.format(**self.settings))
+            p=self._run_cmd('sudo umount {sysroot}/boot'.format(**self.settings))
+
+    def unmount_root(self):
+        p=self._run_cmd('sudo umount {sysroot} ; rmdir {sysroot}'.format(**self.settings))
+
+
 class XSysroot():
     '''
     A class which encapsulates a mount based access to a ARM sysroot image
@@ -79,6 +187,8 @@ class XSysroot():
             self.profile=profile
 
         self._load_profile()
+
+        self.image_handler = QemuImageHandler(self.settings)
 
     def _get_settings_filename(self):
         '''
@@ -112,28 +222,6 @@ class XSysroot():
         with open(self.last_profile_cache, 'w') as f:
             f.write('last_profile: {}\n'.format(profilename))
 
-    def _get_add_mounts(self):
-        '''
-        Returns a list of dictionaries of additional mount points.
-        These optional mounts can be specified using the "add_mounts" key in the
-        configuration file, for example:
-
-          "add_mounts" : "p3:/tmp/third p4:/tmp/fourth"
-
-        Each dictionary comes in the form: { 'device': '/dev/nbdXpY', 'mount': '/wherever' }
-        If no additional mounts are specified, an empty list is returned.
-        '''
-        additional_mounts=[]
-
-        if self.settings.has_key('add_mounts'):
-            extra_mounts = self.settings['add_mounts'].split(' ')
-            for new_mount in extra_mounts:
-                new_device, new_mountpoint = new_mount.split(':')
-                additional_mounts.append(
-                    { 'device' : '{}{}'.format(self.settings['nbdev'], new_device),
-                      'mount'  : '{}'.format(new_mountpoint) })
-
-        return additional_mounts
 
     def _get_virtual_display(self):
         '''
@@ -143,8 +231,7 @@ class XSysroot():
             # Display resolution and window manager to use (e.g. "1024x768x24 fluxbox")
             resolution, win_manager = self.settings['display'].split(' ')
 
-            # The display number will be bound to the same NBDEV device number
-            display_number = re.search('(\d+)', self.settings['nbdev']).group()
+            display_number = self.image_handler.get_display_number()
 
             return display_number, resolution, win_manager
         except:
@@ -359,10 +446,8 @@ class XSysroot():
             p=self._run_cmd('mkdir -p {}'.format(self.settings['sysroot']))
             p=self._run_cmd('mkdir -p {}'.format(self.settings['tmp']))
 
-            # Connect the image and mount the "nbdev" root partition
-            p=self._run_cmd('sudo qemu-nbd -c {nbdev} {qcow_image}; sync'.format(**self.settings))
-            print 'mounting root partition {nbdev}{nbdev_part} -> {sysroot}'.format(**self.settings)
-            p=self._run_cmd('sudo mount {nbdev}{nbdev_part} {sysroot}'.format(**self.settings))
+            # Mount the root partition
+            self.image_handler.mount_root()
 
             # Disable ld.so.preload from dragging QEMU unsupported syscalls (restored on umount)
             if os.path.isfile('{}/{}'.format(self.query('sysroot'), self.ld_so_preload)):
@@ -377,22 +462,10 @@ class XSysroot():
             p=self._run_cmd('sudo mount --bind {tmp} {sysroot}/tmp'.format(**self.settings))
 
             # try to mount the boot partition if specified
-            if self.settings.has_key('boot_part') and self.settings.has_key('sysboot'):
-                p=self._run_cmd('mkdir -p {}'.format(self.settings['sysboot']))
-                print 'mounting boot partition {nbdev}{boot_part} -> {sysboot}'.format(**self.settings)
-                rc=self._run_cmd('sudo mount {nbdev}{boot_part} {sysboot}'.format(**self.settings))
-                if not rc:
-                    # Create a bind mount so the boot partition is accesible from the root
-                    self._run_cmd('sudo mount --bind {sysboot} {sysroot}/boot'.format(**self.settings))
+            self.image_handler.mount_boot()
 
             # mount additional partitions if specified
-            add_mounts = self._get_add_mounts()
-            if len(add_mounts):
-                print 'mounting additional partitions'
-                for extra_mount in add_mounts:
-                    rc=self._run_cmd('mkdir {mount} ; sudo mount {device} {mount}'.format(**extra_mount))
-                    print 'mounted {} => {} rc={}'.format(
-                        extra_mount['device'], extra_mount['mount'], rc)
+            self.image_handler.mount_additional()
 
             mounted=self.is_mounted()
             print 'Mount done'
@@ -418,7 +491,7 @@ class XSysroot():
 
         if not mounted:
             # if problems mounting, tell Qemu to free the image
-            p=self._run_cmd('sudo qemu-nbd -d {nbdev}; sync'.format(**self.settings))
+            self.image_handler.free()
 
         return mounted
 
@@ -451,20 +524,14 @@ class XSysroot():
             p=self._run_cmd('sudo umount {sysroot}/dev'.format(**self.settings))
 
             # try to unmount the boot partition if mounted
-            if self.settings.has_key('boot_part') and self.settings.has_key('sysboot'):
-                p=self._run_cmd('sudo umount {sysboot}'.format(**self.settings))
-                p=self._run_cmd('rmdir {sysboot}'.format(**self.settings))
-                p=self._run_cmd('sudo umount {sysroot}/boot'.format(**self.settings))
+            self.image_handler.unmount_boot()
 
-            p=self._run_cmd('sudo umount {sysroot} ; rmdir {sysroot}'.format(**self.settings))
+            self.image_handler.unmount_root()
 
             # unmount any additional partitions specified
-            add_mounts = self._get_add_mounts()
-            if len(add_mounts):
-                for extra_mount in add_mounts:
-                    rc=self._run_cmd('sudo umount {mount} ; rmdir {mount}'.format(**extra_mount))
+            self.image_handler.unmount_additional()
 
-            p=self._run_cmd('sudo qemu-nbd -d {nbdev}; sync'.format(**self.settings))
+            self.image_handler.free()
             mounted=self.is_mounted()
 
         # Stop the virtual display
